@@ -39,6 +39,41 @@ LABEL_TO_BIN = {
 }
 DEFAULT_BIN_INDEX = 0
 
+# Any model's class names are mapped onto the two canonical labels above, so a
+# fine-tuned model ("plastic"/"can"), a TACO-style model ("Clear plastic bottle",
+# "Drink can", ...) or YOLO-World prompts all route to the right bin.
+# Checked as whole words in the lowercased class name.
+CAN_WORDS = {"can", "cans", "tin", "aluminium", "aluminum"}
+PLASTIC_WORDS = {"bottle", "bottles", "pet"}  # bare "plastic" handled as an exact name below
+# Things that share those words but are not pickable bottles/cans -> left unmapped.
+EXCLUDE_WORDS = {"glass", "foil", "cap", "caps", "lid", "lids", "tab", "tabs", "pop", "wrapper",
+                 "bag", "bags", "film", "straw", "cup", "cups", "carton", "scrap", "litter"}
+
+
+def canonical_label(raw_label: str) -> str:
+    """Map a model class name to "plastic bottle" / "aluminium can" (else return it unchanged)."""
+    key = raw_label.strip().lower()
+    if key in PROMPT_TO_CANONICAL:
+        return PROMPT_TO_CANONICAL[key]
+    if key in ("plastic", "plastics"):
+        return "plastic bottle"
+    words = set(key.replace("_", " ").replace("-", " ").split())
+    if words & EXCLUDE_WORDS:
+        return raw_label
+    if words & CAN_WORDS:
+        return "aluminium can"
+    if words & PLASTIC_WORDS:
+        return "plastic bottle"
+    return raw_label
+
+
+def print_label_mapping(model) -> None:
+    print("[TACO] Model classes -> bin:")
+    for cls_id, name in model.names.items():
+        label = canonical_label(str(name))
+        bin_txt = f"bin {LABEL_TO_BIN[label]}" if label in LABEL_TO_BIN else f"UNMAPPED (default bin {DEFAULT_BIN_INDEX})"
+        print(f"    {cls_id:3d} {name!r:28s} -> {label!r:18s} {bin_txt}")
+
 # Homing pose moved to on program stop (Ctrl+C, Q, ESC) before motors disconnect.
 CUSTOM_HOME_POSE = {
     **HOME_POSE,
@@ -63,15 +98,25 @@ POST_PICK_COOLDOWN_SEC = 0.8     # Settling pause after returning to stow before
 # ==============================================================================
 # 2. WORKSPACE & DETECTOR PARAMETERS
 # ==============================================================================
-WEIGHTS_PATH = "yolov8n_taco.pt"
+WEIGHTS_PATH = "trash_yolo11.pt"
 CONF_THRESH = 0.28
-IMGSZ = 512
+IMGSZ = 640                      # detector input size (whole wide frame letterboxed, same as training)
 TRACK_SCALE = 0.5
-MIN_BOX_AREA = 1600.0
+MIN_BOX_AREA = 1600.0            # in arm-view (640x480) pixels, as originally tuned
 MIN_BOX_SIDE = 25.0
 USE_CLAHE = False
 
-# Large red circle outline (shoulder pan path)
+# Camera: captured at the native 1920x1080 (full field of view, same as the training images).
+# The detector runs on that wide frame; everything else (tracker, pan circle, line, angle,
+# display) keeps working in the ORIGINAL 640x480 "arm view" it was calibrated for.
+# The old 640x480 camera mode was the centre 1280x960 of the sensor scaled by 1/2
+# (measured by feature matching), so:  arm_view = (wide - (320, 60)) / 2
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
+ARM_VIEW_ROI = (320, 60, 1280, 960)  # (x, y, w, h) of the arm view inside the wide frame
+ARM_VIEW_SIZE = (640, 480)
+
+# Large red circle outline (shoulder pan path)   -- arm-view pixels
 PAN_CIRCLE_CENTER = (334, 374)   # (x, y) pixel center of the shoulder pan arc
 PAN_CIRCLE_RADIUS = 143          # Radius in pixels
 PAN_CIRCLE_THICKNESS = 2         # Positive integer = outline only
@@ -115,7 +160,9 @@ def load_detector(weights_path: str):
 
     if os.path.exists(weights_path):
         print(f"[TACO] Loading fine-tuned weights: {weights_path}")
-        return YOLO(weights_path), False, device
+        model = YOLO(weights_path)
+        print_label_mapping(model)
+        return model, False, device
 
     prompts = list(PROMPT_TO_CANONICAL.keys())
     print("[TACO] Loading yolov8s-worldv2.pt for single-object precision tracking...")
@@ -132,22 +179,44 @@ def create_csrt_tracker():
     raise RuntimeError("CSRT not found. Install: pip install --upgrade opencv-contrib-python")
 
 
-def open_source(src: str, width: int = 640, height: int = 480, fps: int = CONTROL_FPS) -> cv2.VideoCapture:
-    if src.isdigit():
+ARM_CAMERA_NAME = "USB2.0_CAM1"   # arm camera USB name (laptop webcam is "USB2.0 HD UVC WebCam")
+
+
+def find_arm_camera(name: str = ARM_CAMERA_NAME) -> str:
+    """Return /dev/videoN of the arm camera, looked up by USB name (index changes on replug)."""
+    by_id = "/dev/v4l/by-id"
+    if os.path.isdir(by_id):
+        for link in sorted(os.listdir(by_id)):
+            if name in link and link.endswith("video-index0"):
+                return os.path.realpath(os.path.join(by_id, link))
+    raise RuntimeError(f"Arm camera {name!r} not found. Check: ls -l /dev/v4l/by-id/")
+
+
+def open_source(src: str, width: int = CAMERA_WIDTH, height: int = CAMERA_HEIGHT,
+                fps: int = CONTROL_FPS) -> cv2.VideoCapture:
+    if src == "arm":
+        src = find_arm_camera()
+        print(f"[CAM] Using arm camera: {src}")
+    if src.isdigit() or src.startswith("/dev/video"):
+        dev = int(src) if src.isdigit() else src
         if sys.platform.startswith("linux"):
-            cap = cv2.VideoCapture(int(src), cv2.CAP_V4L2)
+            cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             cap.set(cv2.CAP_PROP_FPS, fps)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
-            cap = cv2.VideoCapture(int(src))
+            cap = cv2.VideoCapture(dev)
     else:
         cap = cv2.VideoCapture(src)
 
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera/video source: {src!r}")
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[CAM] Resolution: {w}x{h}")
+    if (w, h) != (width, height):
+        print(f"[CAM] WARNING: expected {width}x{height}; pan circle / line pixel positions assume that.")
     return cap
 
 
@@ -157,6 +226,27 @@ def preprocess_for_transparent(frame_bgr: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
     l_eq = clahe.apply(l_chan)
     return cv2.cvtColor(cv2.merge((l_eq, a_chan, b_chan)), cv2.COLOR_LAB2BGR)
+
+
+def wide_to_arm_view(frame_wide: np.ndarray) -> np.ndarray:
+    """Crop + scale the wide 1920x1080 frame to the original 640x480 arm view."""
+    x, y, w, h = ARM_VIEW_ROI
+    return cv2.resize(frame_wide[y:y + h, x:x + w], ARM_VIEW_SIZE, interpolation=cv2.INTER_AREA)
+
+
+def wide_box_to_arm_view(xyxy: np.ndarray) -> Optional[np.ndarray]:
+    """Map a box from wide-frame pixels to arm-view pixels.
+
+    Boxes whose centre lies outside the arm view are dropped (None); the rest are clipped to it.
+    """
+    x, y, w, h = ARM_VIEW_ROI
+    sx, sy = ARM_VIEW_SIZE[0] / w, ARM_VIEW_SIZE[1] / h
+    x1, y1, x2, y2 = (xyxy[0] - x) * sx, (xyxy[1] - y) * sy, (xyxy[2] - x) * sx, (xyxy[3] - y) * sy
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    if not (0 <= cx < ARM_VIEW_SIZE[0] and 0 <= cy < ARM_VIEW_SIZE[1]):
+        return None
+    return np.clip(np.array([x1, y1, x2, y2], dtype=float),
+                   0, [ARM_VIEW_SIZE[0] - 1, ARM_VIEW_SIZE[1] - 1, ARM_VIEW_SIZE[0] - 1, ARM_VIEW_SIZE[1] - 1])
 
 
 def is_valid_box_size(xyxy: np.ndarray, min_area: float, min_side: float) -> bool:
@@ -270,11 +360,14 @@ class AsyncYoloWorker:
                 conf_arr = boxes.conf.cpu().numpy()
                 cls_arr = boxes.cls.cpu().numpy().astype(int)
                 for xyxy, conf, cls_id in zip(xyxy_arr, conf_arr, cls_arr):
+                    # Detector ran on the wide frame -> express the box in arm-view pixels
+                    xyxy = wide_box_to_arm_view(xyxy)
+                    if xyxy is None:
+                        continue
                     if not is_valid_box_size(xyxy, self.min_area, self.min_side):
                         continue
                     raw_label = str(self.model.names[cls_id])
-                    norm_key = raw_label.strip().lower()
-                    label = PROMPT_TO_CANONICAL.get(norm_key, norm_key if self.map_synonyms else raw_label)
+                    label = canonical_label(raw_label)
                     detections.append({"label": label, "conf": float(conf), "xyxy": xyxy})
 
             with self._lock:
@@ -419,7 +512,8 @@ class SingleObjectPrecisionTracker:
 def main() -> None:
     parser = argparse.ArgumentParser(description="SO-101 Stow-Hold Visual Pan Aligner & Auto-Picker")
     parser.add_argument("--port", default="/dev/ttyACM0", help="SO-101 serial port")
-    parser.add_argument("--source", default="0", help="Camera index or video file path")
+    parser.add_argument("--source", default="arm",
+                        help="'arm' (auto-detect arm camera, default), camera index, /dev/videoN, or video file")
     args = parser.parse_args()
 
     _ = create_csrt_tracker()
@@ -467,14 +561,18 @@ def main() -> None:
 
     try:
         while True:
-            ok, frame_bgr = cap.read()
+            ok, frame_wide = cap.read()
             if not ok:
                 print(f"[ERROR] Camera read failed on source={args.source!r}.")
                 break
 
             now = time.perf_counter()
+            # Detector input: clean wide frame. Everything else: original 640x480 arm view.
+            det_frame = preprocess_for_transparent(frame_wide) if USE_CLAHE else frame_wide
+            frame_bgr = wide_to_arm_view(frame_wide)
             h, w = frame_bgr.shape[:2]
-            proc_frame = preprocess_for_transparent(frame_bgr) if USE_CLAHE else frame_bgr
+            # copy so the guide overlays drawn on frame_bgr below don't leak into the tracker
+            proc_frame = preprocess_for_transparent(frame_bgr) if USE_CLAHE else frame_bgr.copy()
 
             # Draw workspace guides & circle-line acceptance band
             line_x = int(CENTER_LINE_X) if CENTER_LINE_X is not None else w // 2
@@ -519,7 +617,7 @@ def main() -> None:
                     arm.update_visual_angle(None)
                     target_hud = f"SETTLING ({POST_PICK_COOLDOWN_SEC:.1f}s)"
                 else:
-                    worker.submit(proc_frame)
+                    worker.submit(det_frame)
 
                     if TRACK_SCALE != 1.0:
                         track_frame = cv2.resize(
@@ -628,4 +726,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()
